@@ -1,0 +1,5 @@
+(executable
+ (name optmain)
+ (modules optmain optcompile)
+ (libraries compiler-libs.optcomp)
+ )

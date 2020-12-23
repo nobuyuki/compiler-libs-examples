@@ -1,101 +1,96 @@
-(***********************************************************************)
-(*                                                                     *)
-(*                                OCaml                                *)
-(*                                                                     *)
-(*            Xavier Leroy, projet Cristal, INRIA Rocquencourt         *)
-(*                                                                     *)
-(*  Copyright 2002 Institut National de Recherche en Informatique et   *)
-(*  en Automatique.  All rights reserved.  This file is distributed    *)
-(*  under the terms of the Q Public License version 1.0.               *)
-(*                                                                     *)
-(***********************************************************************)
+(**************************************************************************)
+(*                                                                        *)
+(*                                 OCaml                                  *)
+(*                                                                        *)
+(*             Xavier Leroy, projet Cristal, INRIA Rocquencourt           *)
+(*                                                                        *)
+(*   Copyright 2002 Institut National de Recherche en Informatique et     *)
+(*     en Automatique.                                                    *)
+(*                                                                        *)
+(*   All rights reserved.  This file is distributed under the terms of    *)
+(*   the GNU Lesser General Public License version 2.1, with the          *)
+(*   special exception on linking described in the file LICENSE.          *)
+(*                                                                        *)
+(**************************************************************************)
 
-(* The batch compiler *)
+(** The batch compiler *)
 
 open Misc
-open Config
-open Format
-open Typedtree
-open Compenv
+open Compile_common
 
-(* Compile a .mli file *)
+let tool_name = "ocamlopt"
 
-(* Keep in sync with the copy in compile.ml *)
+let with_info =
+  Compile_common.with_info ~native:true ~tool_name
 
-let interface ppf sourcefile outputprefix =
-  Compmisc.init_path false;
-  let modulename = module_of_filename ppf sourcefile outputprefix in
-  Env.set_unit_name modulename;
-  let initial_env = Compmisc.initial_env () in
-  let ast = Pparse.parse_interface ppf sourcefile in
-  if !Clflags.dump_parsetree then fprintf ppf "%a@." Printast.interface ast;
-  if !Clflags.dump_source then fprintf ppf "%a@." Pprintast.signature ast;
-  let tsg = Typemod.type_interface initial_env ast in
-  if !Clflags.dump_typedtree then fprintf ppf "%a@." Printtyped.interface tsg;
-  let sg = tsg.sig_type in
-  if !Clflags.print_types then
-    Printtyp.wrap_printing_env initial_env (fun () ->
-        fprintf std_formatter "%a@."
-          Printtyp.signature (Typemod.simplify_signature sg));
-  ignore (Includemod.signatures initial_env sg sg);
-  Typecore.force_delayed_checks ();
-  Warnings.check_fatal ();
-  if not !Clflags.print_types then begin
-    let sg = Env.save_signature sg modulename (outputprefix ^ ".cmi") in
-    Typemod.save_signature modulename tsg outputprefix sourcefile
-      initial_env sg ;
-  end
+let interface ~source_file ~output_prefix =
+  with_info ~source_file ~output_prefix ~dump_ext:"cmi" @@ fun info ->
+  Compile_common.interface info
 
-(* Compile a .ml file *)
+let (|>>) (x, y) f = (x, f y)
 
-let print_if ppf flag printer arg =
-  if !flag then fprintf ppf "%a@." printer arg;
-  arg
+(** Native compilation backend for .ml files. *)
 
-let (++) x f = f x
-let (+++) (x, y) f = (x, f y)
+let flambda i backend typed =
+  if !Clflags.classic_inlining then begin
+    Clflags.default_simplify_rounds := 1;
+    Clflags.use_inlining_arguments_set Clflags.classic_arguments;
+    Clflags.unbox_free_vars_of_closures := false;
+    Clflags.unbox_specialised_args := false
+  end;
+  typed
+  |> Profile.(record transl)
+      (Translmod.transl_implementation_flambda i.module_name)
+  |> Profile.(record generate)
+    (fun {Lambda.module_ident; main_module_block_size;
+          required_globals; code } ->
+    ((module_ident, main_module_block_size), code)
+    |>> print_if i.ppf_dump Clflags.dump_rawlambda Printlambda.lambda
+    |>> Simplif.simplify_lambda
+    |>> print_if i.ppf_dump Clflags.dump_lambda Printlambda.lambda
+    |> (fun ((module_ident, main_module_block_size), code) ->
+      let program : Lambda.program =
+        { Lambda.
+          module_ident;
+          main_module_block_size;
+          required_globals;
+          code;
+        }
+      in
+      Asmgen.compile_implementation
+        ~backend
+        ~filename:i.source_file
+        ~prefixname:i.output_prefix
+        ~middle_end:Flambda_middle_end.lambda_to_clambda
+        ~ppf_dump:i.ppf_dump
+        program);
+    Compilenv.save_unit_info (cmx i))
 
-let implementation ppf sourcefile outputprefix =
-  Compmisc.init_path true;
-  let modulename = module_of_filename ppf sourcefile outputprefix in
-  Env.set_unit_name modulename;
-  let env = Compmisc.initial_env() in
-  Compilenv.reset ?packname:!Clflags.for_package modulename;
-  let cmxfile = outputprefix ^ ".cmx" in
-  let objfile = outputprefix ^ ext_obj in
-  let comp ast =
-    if !Clflags.print_types
-    then
-      ast
-      ++ print_if ppf Clflags.dump_parsetree Printast.implementation
-      ++ print_if ppf Clflags.dump_source Pprintast.structure
-      ++ Typemod.type_implementation sourcefile outputprefix modulename env
-      ++ print_if ppf Clflags.dump_typedtree
-          Printtyped.implementation_with_coercion
-      ++ (fun _ -> ())
-    else begin
-      ast
-      ++ print_if ppf Clflags.dump_parsetree Printast.implementation
-      ++ print_if ppf Clflags.dump_source Pprintast.structure
-      ++ Typemod.type_implementation sourcefile outputprefix modulename env
-      ++ print_if ppf Clflags.dump_typedtree
-          Printtyped.implementation_with_coercion
-      ++ Translmod.transl_store_implementation modulename
-      +++ print_if ppf Clflags.dump_rawlambda Printlambda.lambda
-      +++ Simplif.simplify_lambda
-      +++ print_if ppf Clflags.dump_lambda Printlambda.lambda
-      ++ Asmgen.compile_implementation outputprefix ppf;
-      Compilenv.save_unit_info cmxfile;
-    end;
-    Warnings.check_fatal ();
-    Stypes.dump (Some (outputprefix ^ ".annot"))
+let clambda i backend typed =
+  Clflags.use_inlining_arguments_set Clflags.classic_arguments;
+  typed
+  |> Profile.(record transl)
+    (Translmod.transl_store_implementation i.module_name)
+  |> print_if i.ppf_dump Clflags.dump_rawlambda Printlambda.program
+  |> Profile.(record generate)
+    (fun program ->
+       let code = Simplif.simplify_lambda program.Lambda.code in
+       { program with Lambda.code }
+       |> print_if i.ppf_dump Clflags.dump_lambda Printlambda.program
+       |> Asmgen.compile_implementation
+            ~backend
+            ~filename:i.source_file
+            ~prefixname:i.output_prefix
+            ~middle_end:Closure_middle_end.lambda_to_clambda
+            ~ppf_dump:i.ppf_dump;
+       Compilenv.save_unit_info (cmx i))
+
+let implementation ~backend ~source_file ~output_prefix =
+  let backend info typed =
+    Compilenv.reset ?packname:!Clflags.for_package info.module_name;
+    if Config.flambda
+    then flambda info backend typed
+    else clambda info backend typed
   in
-  try comp (Pparse.parse_implementation ppf sourcefile)
-  with x ->
-    Stypes.dump (Some (outputprefix ^ ".annot"));
-    remove_file objfile;
-    remove_file cmxfile;
-    raise x
-
-let c_file name =
-  if Ccomp.compile_file name <> 0 then exit 2
+  with_info ~source_file ~output_prefix ~dump_ext:"cmx" @@ fun info ->
+  Compile_common.implementation info ~backend

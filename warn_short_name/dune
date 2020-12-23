@@ -1,0 +1,5 @@
+(executable
+ (name optmain)
+ (modules optmain compile_common search flags main_args)
+ (libraries compiler-libs.optcomp compiler-libs.common)
+ )
